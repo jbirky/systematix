@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "systematix"
+version = "0.2.0"
+description = "Instrumental systematics for light-curve injection-recovery tests (Kepler: SAP - PDCSAP for any KIC target)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Jessica Birky"},
+]
+dependencies = [
+    "numpy",
+    "astropy",
+    "lightkurve>=2.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+systematix = "systematix.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not remote'"
+markers = [
+    "remote: downloads data from MAST (run with: pytest -m remote)",
+]
+filterwarnings = [
+    "ignore::UserWarning:lightkurve.prf",
+]

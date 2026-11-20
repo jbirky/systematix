@@ -1,0 +1,4 @@
+validation/*
+.pytest_cache/*
+docs/_build/
+examples/

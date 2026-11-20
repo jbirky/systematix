@@ -1,0 +1,142 @@
+# systematix
+
+Instrumental systematics for light-curve injection-recovery tests. Kepler is the mission implemented so far.
+
+Get the Kepler instrumental systematics for any KIC target: the raw SAP flux minus the PDC-corrected PDCSAP flux, one quarter at a time, stitched into a single light curve.
+
+## Install
+
+```bash
+pip install -e .            # from this directory
+pip install -e ".[test]"    # with pytest
+```
+
+Requires `numpy`, `astropy` and `lightkurve` (used to search and download from MAST). Downloads are cached in `~/.lightkurve/cache`.
+
+## Python
+
+```python
+import systematix as sx
+
+lc = sx.get_systematics("KIC 11904151")                 # all quarters, e-/s
+lc = sx.get_systematics(11904151, quarters=[2, 3, 4])   # a subset
+lc = sx.get_systematics(11904151, normalize=True)       # fractional, per quarter
+
+lc.flux                     # the systematics
+lc["sap_flux"], lc["pdcsap_flux"], lc["quarter"]
+lc.plot()                   # it's a lightkurve.LightCurve
+lc.to_pandas()
+```
+
+The returned `lightkurve.LightCurve` has these columns:
+
+| column | meaning |
+|---|---|
+| `flux` | systematics: `sap_flux - pdcsap_flux_rescaled` (e-/s, or dimensionless if `normalize=True`) |
+| `sap_flux`, `sap_flux_err` | raw SAP flux (e-/s) |
+| `pdcsap_flux` | PDCSAP flux as archived (e-/s) |
+| `pdcsap_flux_rescaled` | PDCSAP put back on the SAP scale (see below) |
+| `quality`, `cadenceno`, `quarter` | from the FITS files |
+
+`flux_err` is NaN on purpose. The pipeline gives no independent uncertainty for the difference. If you want realistic photon noise, use `sap_flux_err`.
+
+To inject systematics into a simulated light curve normalized to 1, use the normalized output:
+
+```python
+sys = sx.get_systematics(kic, normalize=True)
+f_obs = f_sim(sys.time.value) + sys.flux.value
+```
+
+## Command line
+
+```bash
+systematix 11904151                                  # -> kic11904151_systematics.csv
+systematix "KIC 11904151" -q 2 3 4 -n -o sys.ecsv    # quarters 2-4, normalized
+systematix 11904151 --plot sys.png                   # plus a diagnostic plot
+systematix 11904151 --cadence short                  # 1-min data, where available
+```
+
+The output format comes from the file extension (`.csv`, `.ecsv`, `.fits`). `time` is BKJD (BJD − 2454833). You can also run `python -m systematix`.
+
+## What "SAP − PDCSAP" means here
+
+PDC does two things to SAP_FLUX:
+
+1. **Cotrending**: it subtracts a systematics model built from cotrending basis vectors (msMAP). This is the signal you want.
+2. **Crowding and flux-fraction correction** (Kinemuchi et al. 2012):
+   `PDCSAP = (F_cot − (1 − CROWDSAP)·median(F_cot)) / FLFRCSAP`.
+
+A literal `SAP − PDCSAP` mixes in step 2. The crowding term adds a large constant offset (about −10,000 e⁻/s for Kepler-10 Q3). The `1/FLFRCSAP` rescaling also leaks a fraction `1 − 1/FLFRCSAP` of the star's own variability into the "systematics". By default the package undoes step 2 with each quarter's `CROWDSAP`/`FLFRCSAP` header values before differencing, so the result holds only the cotrending correction. Pass `undo_crowding=False` (CLI: `--literal`) to get the plain difference instead.
+
+## Caveats
+
+- Each quarter is a separate aperture on a different CCD, so systematics are computed per file and are not continuous across quarter boundaries.
+- PDC-MAP partly removes real astrophysical signal on long timescales (≳ 20 days, e.g. slow rotators). That signal shows up in the "systematics" here, because they are defined as whatever PDC removed.
+- Undoing crowding uses `median(PDCSAP)` over the cadences that survive quality masking. If those differ slightly from the cadences PDC used, a small constant offset per quarter remains. The time-varying shape is not affected.
+
+## Injection-recovery instrument layer
+
+The package also provides the Kepler side of an injection-recovery framework: systematics sources, an injection model, detrenders with a common interface, and transfer functions. It has no spotgp dependency, so any forward model (spotgp, butterpy) can supply the stellar signal.
+
+```python
+import numpy as np
+import systematix as sx
+
+# Quiet donors: McQuillan et al. (2014) Table 2, stars with no candidate period
+donor = sx.quiet_donors(teff=(5500, 6000), logg_min=4.2)[0]
+
+# Sources: S0 (cadence only), S1 (PDC-removed systematics), S2 (quiet-star SAP)
+sys = sx.PDCRatio(donor, quarters=[2, 3, 4, 5]).realize()
+
+# F_obs = L_q m_q(t) [c_q F_spot + (1 - c_q)] + noise
+f_spot = 1 + 1e-3 * np.sin(2 * np.pi * sys.time / 12.0)
+obs = sx.inject(sys, f_spot, rng=0)
+
+# Detrend: subtract a trend, or return a design matrix + prior to marginalize
+res = sx.CBV(n_cbv=8)(obs)                         # mode (a): fit and subtract
+res = sx.Poly(order=2)(obs, mode="marginalize")    # mode (c): res.design, res.prior_sigma
+
+# How much signal survives each detrender, versus period (no fitting)
+tab = sx.transfer_sweep([sx.QuarterMedian(), sx.CBV(8), sx.RollingMedian(10)], sys,
+                        periods=np.geomspace(0.5, 400, 28))
+```
+
+| Detrender | Kind | Modes |
+|---|---|---|
+| `QuarterMedian` | divide each quarter by its median | subtract |
+| `RollingMedian(window)` | running median, days | subtract |
+| `LkFlatten(window, polyorder)` | lightkurve's iterative Savitzky–Golay | subtract |
+| `Poly(order)` | per-quarter polynomial | subtract, marginalize |
+| `Ramps(taus, order)` | exponential ramps after each gap + per-quarter polynomial | subtract, marginalize |
+| `CBV(n_cbv, prior_sigma)` | Kepler DR25 CBVs per quarter, Gaussian prior on weights | subtract, marginalize |
+| `ARC2(n_max)` | ARC2 CBV correction (Aigrain et al. 2017): shrinkage-prior fit, CBV count chosen per quarter | subtract |
+
+Build from config with `sx.make_detrender({"name": "cbv", "n_cbv": 8})`. Any detrender takes `clip=k` for a robust k-sigma clip after subtraction.
+
+### ARC2 and the optional OxKeplerSC backend
+
+`ARC2` is an MIT reimplementation of the CBV correction in ARC2 ([Aigrain et al. 2017](https://arxiv.org/abs/1706.03064)): variational-Bayes regression with a shrinkage prior on each CBV, fitted with 1 to `n_max` CBVs, keeping the smallest number that brings the light curve's 5–95% range down to the typical level without adding more than 10% point-to-point noise. The number chosen per quarter is in `result.meta["n_cbv_selected"]`. ARC2's jump correction is not included.
+
+The original GPL-3 code, [OxKeplerSC](https://github.com/OxES/OxKeplerSC), is an optional backend. It cannot be pip-installed on current Python (its `setup.py` needs `numpy.distutils`), so point to a clone:
+
+```bash
+git clone https://github.com/OxES/OxKeplerSC.git
+export OXKEPLERSC_PATH=$PWD/OxKeplerSC
+```
+
+```python
+sx.ARC2(backend="oxksc")      # calls OxKeplerSC's sel_nb; scipy aliases it needs are added per call only
+```
+
+With `OXKEPLERSC_PATH` set, `pytest` also checks the native version against OxKeplerSC and against the corrected light curves stored in its repository (weights agree to 1e-9 relative or better).
+
+`examples/transfer_sweep.py` runs the full sweep on a random quiet donor and plots power retained versus period.
+
+CBV files (~30 MB per quarter) and the donor table are cached in `$SYSTEMATIX_CACHE` (default `~/.systematix`).
+
+## Tests
+
+```bash
+pytest              # offline, synthetic data
+pytest -m remote    # downloads Kepler-10, CBVs and the donor table
+```

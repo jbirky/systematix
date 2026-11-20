@@ -1,0 +1,6 @@
+numpy
+astropy
+lightkurve>=2.4
+
+[test]
+pytest

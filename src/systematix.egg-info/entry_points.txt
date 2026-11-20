@@ -1,0 +1,2 @@
+[console_scripts]
+systematix = systematix.cli:main
